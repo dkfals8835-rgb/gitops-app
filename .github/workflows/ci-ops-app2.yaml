@@ -15,7 +15,7 @@ env:
   APP_NAME: ops-app2
   DOCKERHUB_IMAGE: dkfals8835/ops-app2
   CONFIG_REPO: dkfals8835-rgb/gitops-config
-  CONFIG_REPO_PATH: apps/ops-app1/overlays
+  CONFIG_REPO_PATH: apps/ops-app2/overlays
 
 permissions:
   contents: read
