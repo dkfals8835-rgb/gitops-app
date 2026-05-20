@@ -1,38 +1,32 @@
-name: CI ops-app2
+name: CI ops-app2 (ECR)
 
 on:
   push:
     branches: [main]
     paths:
       - 'ops-app2/**'
-      - '.github/workflows/ci-ops-app2.yaml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'ops-app2/**'
+      - '.github/workflows/ci-ops-app2.yml'
 
 env:
   APP_NAME: ops-app2
-  DOCKERHUB_IMAGE: dkfals8835/ops-app2
-  CONFIG_REPO: dkfals8835-rgb/gitops-config
+  ECR_REPOSITORY: ops-app2
+  AWS_REGION: ap-northeast-2
+  CONFIG_REPO: ${{ github.repository_owner }}/gitops-config
   CONFIG_REPO_PATH: apps/ops-app2/overlays
 
 permissions:
+  id-token: write
   contents: read
 
 jobs:
   ci:
-    name: Build and Push
+    name: Build and Push to ECR
     runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: ./ops-app1     # 모노리포의 ops-app1 디렉토리
     outputs:
-      image-tag: ${{ steps.tag.outputs.tag }}
+      image-repo-tag: ${{ steps.export.outputs.image-repo-tag }}
 
     steps:
-      - name: 소스 체크아웃
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Java 17 설정
         uses: actions/setup-java@v4
@@ -42,31 +36,35 @@ jobs:
           cache: 'maven'
 
       - name: Maven 테스트
+        working-directory: ./ops-app2
         run: mvn test -q
 
-      - name: 이미지 태그 생성 (Git SHA 7자리)
-        id: tag
-        run: echo "tag=sha-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
-
-      - name: DockerHub 로그인
-        uses: docker/login-action@v3
+      - name: AWS OIDC 인증
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-terraform-role
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Docker Buildx 설정 (캐시 최적화)
-        uses: docker/setup-buildx-action@v3
+      - name: ECR 로그인
+        uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Docker 빌드 및 Push
-        uses: docker/build-push-action@v5
-        with:
-          context: ./ops-app1                      # 모노리포 경로 명시
-          push: true
-          tags: |
-            ${{ env.DOCKERHUB_IMAGE }}:${{ steps.tag.outputs.tag }}
-            ${{ env.DOCKERHUB_IMAGE }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Docker 빌드 및 ECR Push
+        working-directory: ./ops-app2
+        run: |
+          TAG="sha-${GITHUB_SHA::7}"
+          REGISTRY="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          URI="${REGISTRY}/${{ env.ECR_REPOSITORY }}:${TAG}"
+
+          docker build -t ${URI} .
+          docker push ${URI}
+
+          echo "IMAGE_TAG=${TAG}" >> $GITHUB_ENV
+
+      - name: Export image outputs
+        id: export
+        run: |
+          echo "image-repo-tag=${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "확인 image-repo-tag=${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}"
 
   update-config:
     name: Update Config Repo
@@ -75,6 +73,10 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
+      - name: 값 확인
+        run: |
+          echo "image-repo-tag=${{ needs.ci.outputs.image-repo-tag }}"
+
       - name: Config Repo 체크아웃
         uses: actions/checkout@v4
         with:
@@ -87,22 +89,21 @@ jobs:
           curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
           sudo mv kustomize /usr/local/bin/
 
-      - name: dev overlay 이미지 태그 업데이트
-        env:
-          IMAGE_TAG: ${{ needs.ci.outputs.image-tag }}
+      - name: dev overlay 이미지 업데이트
         run: |
+          # update-config job 에서 registry 직접 조합
+          FULL_URI="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ needs.ci.outputs.image-repo-tag }}"
+          echo "Updated: ${{ env.APP_NAME }}=${FULL_URI}"
           cd config-repo/${{ env.CONFIG_REPO_PATH }}/dev
-          kustomize edit set image \
-            ${{ env.APP_NAME }}=${{ env.DOCKERHUB_IMAGE }}:$IMAGE_TAG
+          kustomize edit set image ${{ env.APP_NAME }}=${FULL_URI}
 
-      - name: Config Repo 커밋 및 Push
-        env:
-          IMAGE_TAG: ${{ needs.ci.outputs.image-tag }}
+      - name: Config Repo 커밋·Push
         run: |
+          FULL_URI="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ needs.ci.outputs.image-repo-tag }}"
           cd config-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .
           git diff --staged --quiet || git commit \
-            -m "chore: update ${{ env.APP_NAME }} dev image to $IMAGE_TAG [skip ci]"
+            -m "chore: update ${{ env.APP_NAME }} dev image to ${FULL_URI} [skip ci]"
           git push
